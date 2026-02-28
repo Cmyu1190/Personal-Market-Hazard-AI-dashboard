@@ -57,15 +57,18 @@ def fetch_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_funding_rate(symbol: str) -> float:
-    # decimal rate (e.g. 0.0001 = 0.01%)
-    url = f"{BINANCE_FUTURES_BASE}/fapi/v1/fundingRate"
-    params = {"symbol": symbol, "limit": 1}
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    if not data:
+    try:
+        url = f"{BINANCE_FUTURES_BASE}/fapi/v1/fundingRate"
+        params = {"symbol": symbol, "limit": 1}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return float("nan")
+        return float(data[-1]["fundingRate"])
+    except Exception as e:
+        # 防止 funding API 炸掉整個 UI
         return float("nan")
-    return float(data[-1]["fundingRate"])
 
 # --------------------------
 # Indicators
@@ -351,5 +354,6 @@ with right:
         st.write("、".join(combined_factors))
     else:
         st.write("（目前沒有明顯觸發因素）")
+
 
 st.caption("下一步如果你要把『某一個時間框架達 No Fight 就直接 No Fight』加成硬規則，我也可以幫你加。")
