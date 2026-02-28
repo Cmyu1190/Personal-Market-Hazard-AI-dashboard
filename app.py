@@ -4,7 +4,7 @@ import requests
 import numpy as np
 import pandas as pd
 
-st.set_page_config(page_title="Personal Market Hazard AI (MTF)", layout="wide")
+st.set_page_config(page_title="Personal Market Hazard AI (Stable)", layout="wide")
 
 # --------------------------
 # Auth: Simple Password Gate
@@ -31,65 +31,55 @@ if not check_password():
     st.stop()
 
 # --------------------------
-# Binance Futures (USDT-M) fetch
+# API endpoints
 # --------------------------
-BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 BINANCE_SPOT_BASE = "https://api.binance.com"
+BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 
+# --------------------------
+# Robust fetchers (never crash UI)
+# --------------------------
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame | None:
-    """
-    Try Futures first, fallback to Spot if Futures blocked.
-    Return None if both fail (so UI won't crash).
-    """
-    def _call(url, params):
+def fetch_spot_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame | None:
+    try:
+        url = f"{BINANCE_SPOT_BASE}/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
         r = requests.get(url, params=params, timeout=10)
         if r.status_code != 200:
-            return None, r.status_code
-        return r.json(), 200
+            return None
+        data = r.json()
 
-    # 1) Futures klines
-    fut_url = f"{BINANCE_FUTURES_BASE}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    data, code = _call(fut_url, params)
-
-    source = "futures"
-    if data is None:
-        # 2) Fallback Spot klines
-        spot_url = f"{BINANCE_SPOT_BASE}/api/v3/klines"
-        data, code = _call(spot_url, params)
-        source = "spot"
-
-    if data is None:
-        # both failed
+        cols = [
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_volume","n_trades",
+            "taker_buy_base","taker_buy_quote","ignore"
+        ]
+        df = pd.DataFrame(data, columns=cols)
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        for c in ["open","high","low","close","volume","quote_volume","taker_buy_base","taker_buy_quote"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["close","high","low","volume"]).reset_index(drop=True)
+        df.attrs["source"] = "spot"
+        return df
+    except Exception:
         return None
 
-    cols = [
-        "open_time","open","high","low","close","volume",
-        "close_time","quote_volume","n_trades",
-        "taker_buy_base","taker_buy_quote","ignore"
-    ]
-    df = pd.DataFrame(data, columns=cols)
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    for c in ["open","high","low","close","volume","quote_volume","taker_buy_base","taker_buy_quote"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["close","high","low","volume"]).reset_index(drop=True)
-    df.attrs["source"] = source
-    return df
-
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_funding_rate(symbol: str) -> float:
+def fetch_funding_rate_safe(symbol: str) -> float:
+    """
+    Optional enhancer. If blocked -> return NaN, never crash.
+    """
     try:
         url = f"{BINANCE_FUTURES_BASE}/fapi/v1/fundingRate"
         params = {"symbol": symbol, "limit": 1}
         r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
+        if r.status_code != 200:
+            return float("nan")
         data = r.json()
         if not data:
             return float("nan")
-        return float(data[-1]["fundingRate"])
-    except Exception as e:
-        # 防止 funding API 炸掉整個 UI
+        return float(data[-1]["fundingRate"])  # decimal
+    except Exception:
         return float("nan")
 
 # --------------------------
@@ -122,7 +112,7 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
     return tr.rolling(period).mean()
 
-def compute_auto_features(df: pd.DataFrame, lookback_sr: int = 100) -> dict:
+def compute_features(df: pd.DataFrame, lookback_sr: int = 100) -> dict:
     close = df["close"]
     vol = df["volume"]
 
@@ -152,10 +142,7 @@ def compute_auto_features(df: pd.DataFrame, lookback_sr: int = 100) -> dict:
         "sup": sup,
     }
 
-# --------------------------
-# Auto Flags (same thresholds as your React)
-# --------------------------
-def compute_flags(feats: dict, funding_rate: float):
+def flags_from_features(feats: dict, funding_rate: float):
     price = feats["price"]
     ema20 = feats["ema20"]
 
@@ -183,15 +170,12 @@ def compute_flags(feats: dict, funding_rate: float):
     if np.isfinite(feats["vol_avg"]):
         volume_high = feats["vol_current"] > feats["vol_avg"] * 1.5
 
-    # 0.05% = 0.0005 decimal
+    # funding extreme if available
     if np.isfinite(funding_rate):
-        funding_extreme = abs(funding_rate) >= 0.0005
+        funding_extreme = abs(funding_rate) >= 0.0005  # 0.05%
 
     return atr_high, ema_stretched, position_edge, volume_high, funding_extreme
 
-# --------------------------
-# Scoring (same weights as your React)
-# --------------------------
 def score_one_tf(atr_high, ema_stretched, position_edge, rsi_val, volume_high, funding_extreme):
     score = 0
     factors = []
@@ -207,8 +191,7 @@ def score_one_tf(atr_high, ema_stretched, position_edge, rsi_val, volume_high, f
         score += 15; factors.append("人擠人太吵雜")
     if funding_extreme:
         score += 10; factors.append("借錢代價太高")
-    score = max(0, min(100, score))
-    return score, factors
+    return max(0, min(100, score)), factors
 
 def regime_and_rules(score: int, factors: list[str]):
     def simple_reason(score, factors):
@@ -221,48 +204,19 @@ def regime_and_rules(score: int, factors: list[str]):
         return f"現在像是大地震或龍捲風（{'、'.join(factors)}），路上到處是陷阱。聰明的小孩現在應該乖乖待在家裡看書，絕對不要出門！"
 
     if score <= 30:
-        return {
-            "regime": "Normal (正常)",
-            "diagnosis": "🟢 評分優良：環境穩定，可以按照原定計畫進場。",
-            "multiplier": 1.0,
-            "rules": ["允許正常交易計畫進場", "保持常規風險控管", "可依訊號順勢加碼"],
-            "simple_reason": simple_reason(score, factors),
-        }
+        return "Normal (正常)", "🟢 評分優良：環境穩定，可以按照原定計畫進場。", 1.0, \
+               ["允許正常交易計畫進場", "保持常規風險控管", "可依訊號順勢加碼"], simple_reason(score, factors)
     if score <= 60:
-        return {
-            "regime": "Caution (注意)",
-            "diagnosis": "🟡 風險升溫：可以進場，但必須縮減一半倉位，嚴禁貪心。",
-            "multiplier": 0.5,
-            "rules": ["減少一半倉位大小", "禁止追單（錯過不追）", "提高止盈敏感度", "若虧損一單即暫停觀察"],
-            "simple_reason": simple_reason(score, factors),
-        }
+        return "Caution (注意)", "🟡 風險升溫：可以進場，但必須縮減一半倉位，嚴禁貪心。", 0.5, \
+               ["減少一半倉位大小", "禁止追單（錯過不追）", "提高止盈敏感度", "若虧損一單即暫停觀察"], simple_reason(score, factors)
     if score <= 80:
-        return {
-            "regime": "Survival (生存模式)",
-            "diagnosis": "🟠 極高風險：不建議新開單。若非進不可，僅能用極小資金試探。",
-            "multiplier": 0.25,
-            "rules": ["只允許極小倉位試單", "只允許一次進場，絕對禁止加碼", "嚴格設定硬止損", "目標轉換為「活下來」而非獲利"],
-            "simple_reason": simple_reason(score, factors),
-        }
-    return {
-        "regime": "No Fight (禁止交易)",
-        "diagnosis": "🔴 絕對禁止：目前環境不適合任何策略，進場等於送錢給市場。",
-        "multiplier": 0.0,
-        "rules": ["立刻關閉交易軟體", "目前市場極度危險或處於隨機波動", "去散步、看書或睡覺", "保護本金，等待市場結構重置"],
-        "simple_reason": simple_reason(score, factors),
-    }
+        return "Survival (生存模式)", "🟠 極高風險：不建議新開單。若非進不可，僅能用極小資金試探。", 0.25, \
+               ["只允許極小倉位試單", "只允許一次進場，絕對禁止加碼", "嚴格設定硬止損", "目標轉換為「活下來」而非獲利"], simple_reason(score, factors)
+    return "No Fight (禁止交易)", "🔴 絕對禁止：目前環境不適合任何策略，進場等於送錢給市場。", 0.0, \
+           ["立刻關閉交易軟體", "目前市場極度危險或處於隨機波動", "去散步、看書或睡覺", "保護本金，等待市場結構重置"], simple_reason(score, factors)
 
-# --------------------------
-# MTF aggregation (A: 5m+15m+1h)
-# --------------------------
 def aggregate_mtf(scores: dict[str, int]) -> tuple[int, list[str]]:
-    """
-    scores: {"5m": s1, "15m": s2, "1h": s3}
-    Weighted average + conflict penalty:
-      - weights: 5m 0.25, 15m 0.35, 1h 0.40
-      - penalty: if max-min >= 40 => +10
-                 if max-min >= 60 => +20
-    """
+    # A: 5m+15m+1h
     w = {"5m": 0.25, "15m": 0.35, "1h": 0.40}
     base = int(round(sum(scores[k] * w[k] for k in scores)))
     spread = max(scores.values()) - min(scores.values())
@@ -276,73 +230,76 @@ def aggregate_mtf(scores: dict[str, int]) -> tuple[int, list[str]]:
         notes.append(f"時間框架衝突偏大（spread={spread}）→ +10（盤勢不一致）")
     else:
         notes.append(f"時間框架一致性良好（spread={spread}）")
-
     return base, notes
 
 # --------------------------
 # UI
 # --------------------------
-st.title("🛡️ Personal Market Hazard AI（MTF：5m + 15m + 1h）")
-st.caption("一次 Refresh 同時抓三個週期，做加權總評分 + 一致性懲罰")
+st.title("🛡️ Personal Market Hazard AI（穩定版：Spot K線 + MTF）")
+st.caption("使用 Binance Spot K線（雲端更穩），Funding 只做加分項：抓不到就自動忽略")
 
-c1, c2, c3 = st.columns([1, 1, 1])
+c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
 with c1:
     symbol = st.selectbox("標的", ["BTCUSDT", "ETHUSDT", "SOLUSDT"], index=0)
 with c2:
     lookback_sr = st.number_input("支撐/阻力回看根數", min_value=50, max_value=300, value=100, step=10)
 with c3:
     limit = st.number_input("K 線拉取根數", min_value=200, max_value=1500, value=500, step=50)
+with c4:
+    use_funding = st.toggle("使用 Funding 加成（可選）", value=False)
 
 if st.button("🔄 Refresh now"):
-    fetch_klines.clear()
-    fetch_funding_rate.clear()
+    fetch_spot_klines.clear()
+    fetch_funding_rate_safe.clear()
     st.cache_data.clear()
     st.rerun()
 
-with st.spinner("Fetching Binance Futures data (5m/15m/1h)..."):
-    funding = fetch_funding_rate(symbol)  # decimal, shared
+funding = float("nan")
+if use_funding:
+    funding = fetch_funding_rate_safe(symbol)
 
-    tfs = ["5m", "15m", "1h"]
-    dfs = {}
-    feats_map = {}
-    flags_map = {}
-    score_map = {}
-    factors_map = {}
+tfs = ["5m", "15m", "1h"]
+dfs = {}
+feats_map = {}
+score_map = {}
+factors_map = {}
 
+with st.spinner("Fetching Spot data (5m/15m/1h)..."):
     for tf in tfs:
-        df = fetch_klines(symbol, tf, limit=int(limit))
+        df = fetch_spot_klines(symbol, tf, limit=int(limit))
         if df is None or df.empty:
-            st.error(f"❌ 無法取得 {symbol} {tf} K線（Binance API 可能被限制/限流）。")
+            st.error(f"❌ 無法取得 {symbol} {tf} K線（Spot API 可能暫時限流）。請稍後再試。")
             st.stop()
+
         dfs[tf] = df
-        feats = compute_auto_features(df, lookback_sr=int(lookback_sr))
+        feats = compute_features(df, lookback_sr=int(lookback_sr))
         feats_map[tf] = feats
-        flags = compute_flags(feats, funding)
-        flags_map[tf] = flags
-        s, fac = score_one_tf(*flags[:3], feats["rsi14"], flags[3], flags[4])
+
+        atr_high, ema_stretched, position_edge, volume_high, funding_extreme = flags_from_features(feats, funding)
+        s, fac = score_one_tf(atr_high, ema_stretched, position_edge, feats["rsi14"], volume_high, funding_extreme)
         score_map[tf] = s
         factors_map[tf] = fac
 
-    total_score, mtf_notes = aggregate_mtf(score_map)
-    # Use combined factors (union) for explanation
-    combined_factors = []
-    for tf in tfs:
-        for f in factors_map[tf]:
-            if f not in combined_factors:
-                combined_factors.append(f)
+total_score, mtf_notes = aggregate_mtf(score_map)
 
-    out = regime_and_rules(total_score, combined_factors)
+combined_factors = []
+for tf in tfs:
+    for f in factors_map[tf]:
+        if f not in combined_factors:
+            combined_factors.append(f)
 
-# -------- Layout --------
+regime, diagnosis, multiplier, rules, reason = regime_and_rules(total_score, combined_factors)
+
 left, right = st.columns([1.2, 1], gap="large")
 
 with left:
-    st.subheader("📌 MTF Scores")
+    st.subheader("📌 MTF Scores（Spot）")
     mtf_df = pd.DataFrame([{
         "5m_score": score_map["5m"],
         "15m_score": score_map["15m"],
         "1h_score": score_map["1h"],
-        "funding_%": (funding * 100) if np.isfinite(funding) else np.nan,
+        "funding_% (optional)": (funding * 100) if np.isfinite(funding) else np.nan,
+        "data_source": "Binance Spot",
     }])
     st.dataframe(mtf_df, use_container_width=True)
 
@@ -361,26 +318,17 @@ with left:
 
 with right:
     st.subheader("✅ Final Hazard Output")
-
     st.metric("Hazard Score (MTF)", total_score)
-    st.metric("Regime", out["regime"])
-    st.metric("Position Multiplier", f"{out['multiplier']}x")
-    st.info(out["diagnosis"])
+    st.metric("Regime", regime)
+    st.metric("Position Multiplier", f"{multiplier}x")
+    st.info(diagnosis)
 
     st.markdown("#### 為什麼？（科普版）")
-    st.write(f"「{out['simple_reason']}」")
+    st.write(f"「{reason}」")
 
     st.markdown("#### Rules")
-    for rule in out["rules"]:
+    for rule in rules:
         st.write(f"- {rule}")
 
     st.markdown("#### 觸發因素（合併）")
-    if combined_factors:
-        st.write("、".join(combined_factors))
-    else:
-        st.write("（目前沒有明顯觸發因素）")
-
-
-st.caption("下一步如果你要把『某一個時間框架達 No Fight 就直接 No Fight』加成硬規則，我也可以幫你加。")
-
-
+    st.write("、".join(combined_factors) if combined_factors else "（目前沒有明顯觸發因素）")
