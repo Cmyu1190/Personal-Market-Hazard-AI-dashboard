@@ -311,9 +311,9 @@ with st.spinner("Fetching Binance Futures data (5m/15m/1h)..."):
 
     for tf in tfs:
         df = fetch_klines(symbol, tf, limit=int(limit))
-if df is None or df.empty:
-    st.error(f"❌ 無法取得 {symbol} {tf} K線（Binance API 可能被限制/限流）。")
-    st.stop()
+        if df is None or df.empty:
+            st.error(f"❌ 無法取得 {symbol} {tf} K線（Binance API 可能被限制/限流）。")
+            st.stop()
         dfs[tf] = df
         feats = compute_auto_features(df, lookback_sr=int(lookback_sr))
         feats_map[tf] = feats
@@ -382,4 +382,5 @@ with right:
 
 
 st.caption("下一步如果你要把『某一個時間框架達 No Fight 就直接 No Fight』加成硬規則，我也可以幫你加。")
+
 
