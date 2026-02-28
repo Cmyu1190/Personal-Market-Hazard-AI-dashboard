@@ -34,14 +34,35 @@ if not check_password():
 # Binance Futures (USDT-M) fetch
 # --------------------------
 BINANCE_FUTURES_BASE = "https://fapi.binance.com"
+BINANCE_SPOT_BASE = "https://api.binance.com"
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
-    url = f"{BINANCE_FUTURES_BASE}/fapi/v1/klines"
+def fetch_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame | None:
+    """
+    Try Futures first, fallback to Spot if Futures blocked.
+    Return None if both fail (so UI won't crash).
+    """
+    def _call(url, params):
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return None, r.status_code
+        return r.json(), 200
+
+    # 1) Futures klines
+    fut_url = f"{BINANCE_FUTURES_BASE}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
+    data, code = _call(fut_url, params)
+
+    source = "futures"
+    if data is None:
+        # 2) Fallback Spot klines
+        spot_url = f"{BINANCE_SPOT_BASE}/api/v3/klines"
+        data, code = _call(spot_url, params)
+        source = "spot"
+
+    if data is None:
+        # both failed
+        return None
 
     cols = [
         "open_time","open","high","low","close","volume",
@@ -53,6 +74,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
     for c in ["open","high","low","close","volume","quote_volume","taker_buy_base","taker_buy_quote"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["close","high","low","volume"]).reset_index(drop=True)
+    df.attrs["source"] = source
     return df
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -289,6 +311,9 @@ with st.spinner("Fetching Binance Futures data (5m/15m/1h)..."):
 
     for tf in tfs:
         df = fetch_klines(symbol, tf, limit=int(limit))
+if df is None or df.empty:
+    st.error(f"❌ 無法取得 {symbol} {tf} K線（Binance API 可能被限制/限流）。")
+    st.stop()
         dfs[tf] = df
         feats = compute_auto_features(df, lookback_sr=int(lookback_sr))
         feats_map[tf] = feats
@@ -357,3 +382,4 @@ with right:
 
 
 st.caption("下一步如果你要把『某一個時間框架達 No Fight 就直接 No Fight』加成硬規則，我也可以幫你加。")
+
